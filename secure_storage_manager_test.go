@@ -1,6 +1,8 @@
 package gosnowflake
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -71,7 +73,7 @@ func TestSnowflakeFileBasedSecureStorageManager(t *testing.T) {
 	assertNilF(t, err)
 
 	t.Run("store single token", func(t *testing.T) {
-		tokenSpec := newMfaTokenSpec("host.com", "johndoe")
+		tokenSpec := newMfaTokenSpec(&Config{Host: "host.com", User: "johndoe"})
 		cred := "token123"
 		ssm.setCredential(tokenSpec, cred)
 		assertEqualE(t, ssm.getCredential(tokenSpec), cred)
@@ -80,13 +82,13 @@ func TestSnowflakeFileBasedSecureStorageManager(t *testing.T) {
 	})
 
 	t.Run("store tokens of different types, hosts and users", func(t *testing.T) {
-		mfaTokenSpec := newMfaTokenSpec("host.com", "johndoe")
+		mfaTokenSpec := newMfaTokenSpec(&Config{Host: "host.com", User: "johndoe"})
 		mfaCred := "token12"
-		idTokenSpec := newIDTokenSpec("host.com", "johndoe")
+		idTokenSpec := newIDTokenSpec(&Config{Host: "host.com", User: "johndoe"})
 		idCred := "token34"
-		idTokenSpec2 := newIDTokenSpec("host.org", "johndoe")
+		idTokenSpec2 := newIDTokenSpec(&Config{Host: "host.org", User: "johndoe"})
 		idCred2 := "token56"
-		idTokenSpec3 := newIDTokenSpec("host.com", "someoneelse")
+		idTokenSpec3 := newIDTokenSpec(&Config{Host: "host.com", User: "someoneelse"})
 		idCred3 := "token78"
 		ssm.setCredential(mfaTokenSpec, mfaCred)
 		ssm.setCredential(idTokenSpec, idCred)
@@ -104,9 +106,9 @@ func TestSnowflakeFileBasedSecureStorageManager(t *testing.T) {
 	})
 
 	t.Run("override single token", func(t *testing.T) {
-		mfaTokenSpec := newMfaTokenSpec("host.com", "johndoe")
+		mfaTokenSpec := newMfaTokenSpec(&Config{Host: "host.com", User: "johndoe"})
 		mfaCred := "token123"
-		idTokenSpec := newIDTokenSpec("host.com", "johndoe")
+		idTokenSpec := newIDTokenSpec(&Config{Host: "host.com", User: "johndoe"})
 		idCred := "token456"
 		ssm.setCredential(mfaTokenSpec, mfaCred)
 		ssm.setCredential(idTokenSpec, idCred)
@@ -118,7 +120,7 @@ func TestSnowflakeFileBasedSecureStorageManager(t *testing.T) {
 	})
 
 	t.Run("unlock stale cache", func(t *testing.T) {
-		tokenSpec := newMfaTokenSpec("stale", "cache")
+		tokenSpec := newMfaTokenSpec(&Config{Host: "stale", User: "cache"})
 		assertNilF(t, os.Mkdir(ssm.lockPath(), 0700))
 		time.Sleep(1000 * time.Millisecond)
 		ssm.setCredential(tokenSpec, "unlocked")
@@ -126,7 +128,7 @@ func TestSnowflakeFileBasedSecureStorageManager(t *testing.T) {
 	})
 
 	t.Run("wait for other process to unlock cache", func(t *testing.T) {
-		tokenSpec := newMfaTokenSpec("stale", "cache")
+		tokenSpec := newMfaTokenSpec(&Config{Host: "stale", User: "cache"})
 		startTime := time.Now()
 		assertNilF(t, os.Mkdir(ssm.lockPath(), 0700))
 		time.Sleep(500 * time.Millisecond)
@@ -146,14 +148,14 @@ func TestSnowflakeFileBasedSecureStorageManager(t *testing.T) {
 		}`)
 		err = os.WriteFile(ssm.credFilePath(), content, 0600)
 		assertNilF(t, err)
-		ssm.setCredential(newMfaTokenSpec("somehost.com", "someUser"), "someToken")
+		ssm.setCredential(newMfaTokenSpec(&Config{Host: "somehost.com", User: "someUser"}), "someToken")
 		result, err := os.ReadFile(ssm.credFilePath())
 		assertNilF(t, err)
 		assertStringContainsE(t, string(result), `"otherKey":"otherValue"`)
 	})
 
 	t.Run("should not modify file if it has wrong permission", func(t *testing.T) {
-		tokenSpec := newMfaTokenSpec("somehost.com", "someUser")
+		tokenSpec := newMfaTokenSpec(&Config{Host: "somehost.com", User: "someUser"})
 		ssm.setCredential(tokenSpec, "initialValue")
 		assertEqualE(t, ssm.getCredential(tokenSpec), "initialValue")
 		err = os.Chmod(ssm.credFilePath(), 0644)
@@ -175,7 +177,7 @@ func TestSnowflakeFileBasedSecureStorageManager(t *testing.T) {
 	})
 
 	t.Run("should not modify file if its dir has wrong permission", func(t *testing.T) {
-		tokenSpec := newMfaTokenSpec("somehost.com", "someUser")
+		tokenSpec := newMfaTokenSpec(&Config{Host: "somehost.com", User: "someUser"})
 		ssm.setCredential(tokenSpec, "initialValue")
 		assertEqualE(t, ssm.getCredential(tokenSpec), "initialValue")
 		err = os.Chmod(ssm.credDirPath, 0777)
@@ -211,7 +213,7 @@ func TestFileBasedCacheSkipPermissionsVerification(t *testing.T) {
 	ssm, err := newFileBasedSecureStorageManager()
 	assertNilF(t, err)
 
-	tokenSpec := newMfaTokenSpec("somehost.com", "someUser")
+	tokenSpec := newMfaTokenSpec(&Config{Host: "somehost.com", User: "someUser"})
 
 	t.Run("round-trip with 0644 cache file", func(t *testing.T) {
 		ssm.setCredential(tokenSpec, "initialValue")
@@ -238,48 +240,55 @@ func TestFileBasedCacheSkipPermissionsVerification(t *testing.T) {
 
 func TestSetAndGetCredential(t *testing.T) {
 	skipOnMissingHome(t)
-	for _, tokenSpec := range []*secureTokenSpec{
-		newMfaTokenSpec("testhost", "testuser"),
-		newIDTokenSpec("testhost", "testuser"),
+	for _, tc := range []struct {
+		name string
+		spec secureTokenSpec
+	}{
+		{string(mfaToken), newMfaTokenSpec(&Config{Host: "testhost", User: "testuser"})},
+		{string(idToken), newIDTokenSpec(&Config{Host: "testhost", User: "testuser"})},
 	} {
-		t.Run(string(tokenSpec.tokenType), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			skipOnMac(t, "keyring asks for password")
 			fakeMfaToken := "test token"
-			tokenSpec := newMfaTokenSpec("testHost", "testUser")
-			credentialsStorage.setCredential(tokenSpec, fakeMfaToken)
-			assertEqualE(t, credentialsStorage.getCredential(tokenSpec), fakeMfaToken)
+			credentialsStorage.setCredential(tc.spec, fakeMfaToken)
+			assertEqualE(t, credentialsStorage.getCredential(tc.spec), fakeMfaToken)
 
-			// delete credential and check it no longer exists
-			credentialsStorage.deleteCredential(tokenSpec)
-			assertEqualE(t, credentialsStorage.getCredential(tokenSpec), "")
+			credentialsStorage.deleteCredential(tc.spec)
+			assertEqualE(t, credentialsStorage.getCredential(tc.spec), "")
 		})
 	}
 }
 
 func TestSkipStoringCredentialIfUserIsEmpty(t *testing.T) {
-	tokenSpecs := []*secureTokenSpec{
-		newMfaTokenSpec("mfaHost.com", ""),
-		newIDTokenSpec("idHost.com", ""),
+	specs := []struct {
+		host string
+		spec secureTokenSpec
+	}{
+		{"mfaHost.com", newMfaTokenSpec(&Config{Host: "mfaHost.com", User: ""})},
+		{"idHost.com", newIDTokenSpec(&Config{Host: "idHost.com", User: ""})},
 	}
 
-	for _, tokenSpec := range tokenSpecs {
-		t.Run(tokenSpec.host, func(t *testing.T) {
-			credentialsStorage.setCredential(tokenSpec, "non-empty-value")
-			assertEqualE(t, credentialsStorage.getCredential(tokenSpec), "")
+	for _, tc := range specs {
+		t.Run(tc.host, func(t *testing.T) {
+			credentialsStorage.setCredential(tc.spec, "non-empty-value")
+			assertEqualE(t, credentialsStorage.getCredential(tc.spec), "")
 		})
 	}
 }
 
 func TestSkipStoringCredentialIfHostIsEmpty(t *testing.T) {
-	tokenSpecs := []*secureTokenSpec{
-		newMfaTokenSpec("", "mfaUser"),
-		newIDTokenSpec("", "idUser"),
+	specs := []struct {
+		user string
+		spec secureTokenSpec
+	}{
+		{"mfaUser", newMfaTokenSpec(&Config{Host: "", User: "mfaUser"})},
+		{"idUser", newIDTokenSpec(&Config{Host: "", User: "idUser"})},
 	}
 
-	for _, tokenSpec := range tokenSpecs {
-		t.Run(tokenSpec.user, func(t *testing.T) {
-			credentialsStorage.setCredential(tokenSpec, "non-empty-value")
-			assertEqualE(t, credentialsStorage.getCredential(tokenSpec), "")
+	for _, tc := range specs {
+		t.Run(tc.user, func(t *testing.T) {
+			credentialsStorage.setCredential(tc.spec, "non-empty-value")
+			assertEqualE(t, credentialsStorage.getCredential(tc.spec), "")
 		})
 	}
 }
@@ -290,14 +299,20 @@ func TestStoreTemporaryCredential(t *testing.T) {
 	}
 
 	testcases := []struct {
-		tokenSpec *secureTokenSpec
+		tokenSpec secureTokenSpec
 		value     string
 	}{
-		{newMfaTokenSpec("testhost", "testuser"), "mfa token"},
-		{newIDTokenSpec("testhost", "testuser"), "id token"},
-		{newOAuthAccessTokenSpec("testhost", "testuser"), "access token"},
-		{newOAuthRefreshTokenSpec("testhost", "testuser"), "refresh token"},
+		{newMfaTokenSpec(&Config{Host: "testhost", User: "testuser"}), "mfa token"},
+		{newIDTokenSpec(&Config{Host: "testhost", User: "testuser"}), "id token"},
+		{newOAuthAccessTokenSpec(&Config{OauthTokenRequestURL: "https://idp.example.com/token", Host: "testhost", User: "testuser", Role: "testrole"}), "access token"},
+		{newOAuthRefreshTokenSpec(&Config{OauthTokenRequestURL: "https://idp.example.com/token", Host: "testhost", User: "testuser", Role: "testrole"}), "refresh token"},
 	}
+
+	credCacheDir, err := os.MkdirTemp("", "")
+	assertNilF(t, err)
+	defer os.RemoveAll(credCacheDir)
+	credCacheDirEnvOverride := overrideEnv(credCacheDirEnv, credCacheDir)
+	defer credCacheDirEnvOverride.rollback()
 
 	ssm, err := newFileBasedSecureStorageManager()
 	assertNilF(t, err)
@@ -312,21 +327,269 @@ func TestStoreTemporaryCredential(t *testing.T) {
 	}
 }
 
-func TestBuildCredentialsKey(t *testing.T) {
+func TestBuildCacheKeyOAuthGoldenHash(t *testing.T) {
+	// Golden vector A: OAuth flow with DPOP_BUNDLED_ACCESS_TOKEN.
+	// Raw inputs go through normalizeURL and normalizeIdentifier;
+	// lowercase inside quotes is preserved verbatim.
+	// Expected canonical JSON (4 OAuth fields, no token_type):
+	//   {"idp":"LOGIN.MICROSOFTONLINE.COM:443/TENANT-ID/OAUTH2/V2.0",
+	//    "role":"\"Analyst Role With Spaces\":NORTH_AMERICA:PROD:READONLY",
+	//    "snowflake":"MYORG-MYACCOUNT.PRIVATELINK.SNOWFLAKECOMPUTING.COM",
+	//    "username":"\"First Last\"@LONG-CORPORATE-DOMAIN.EXAMPLE.COM"}
+	spec := &oauthTokenSpec{
+		tokenType: "DPOP_BUNDLED_ACCESS_TOKEN",
+		idp:       "https://login.microsoftonline.com:443/tenant-id/oauth2/v2.0",
+		snowflake: "https://myorg-myaccount.privatelink.snowflakecomputing.com",
+		username:  `"First Last"@long-corporate-domain.example.com`,
+		role:      `"Analyst Role With Spaces":north_america:prod:readonly`,
+	}
+	key, err := spec.buildKey()
+	assertNilF(t, err)
+	assertEqualF(t, key, "SnowflakeTokenCache.v2.DPOP_BUNDLED_ACCESS_TOKEN.be782aa7c9abf8698adc9e6de61b954ccec7d9202899b44c2eb4e1dfa4313d5f") // pragma: allowlist secret
+}
+
+func TestBuildCacheKeyMfaGoldenHash(t *testing.T) {
+	// Golden vector B: MFA flow — only snowflake + username in keyData.
+	// Expected canonical JSON (2 MFA fields, no idp/role/token_type):
+	//   {"snowflake":"MYORG-MYACCOUNT.PRIVATELINK.SNOWFLAKECOMPUTING.COM",
+	//    "username":"\"First Last\"@LONG-CORPORATE-DOMAIN.EXAMPLE.COM"}
+	spec := &hostUserTokenSpec{
+		tokenType: mfaToken,
+		snowflake: "https://myorg-myaccount.privatelink.snowflakecomputing.com",
+		username:  `"First Last"@long-corporate-domain.example.com`,
+	}
+	key, err := spec.buildKey()
+	assertNilF(t, err)
+	assertEqualF(t, key, "SnowflakeTokenCache.v2.MFA_TOKEN.a508fa2858a6e22e9fdbc90b4149a3ff666d1acbb286c85ff179499ac92d75c8") // pragma: allowlist secret
+}
+
+func TestBuildCacheKeyValidation(t *testing.T) {
+	t.Run("empty snowflake rejects", func(t *testing.T) {
+		spec := &hostUserTokenSpec{tokenType: mfaToken, snowflake: "", username: "user"}
+		_, err := spec.buildKey()
+		assertNotNilF(t, err)
+		assertStringContainsE(t, err.Error(), "snowflake URL is required")
+	})
+
+	t.Run("empty username rejects", func(t *testing.T) {
+		spec := &hostUserTokenSpec{tokenType: mfaToken, snowflake: "host.com", username: ""}
+		_, err := spec.buildKey()
+		assertNotNilF(t, err)
+		assertStringContainsE(t, err.Error(), "username is required")
+	})
+
+	t.Run("OAuth empty idp rejects", func(t *testing.T) {
+		spec := &oauthTokenSpec{tokenType: oauthAccessToken, idp: "", snowflake: "host.com", username: "user"}
+		_, err := spec.buildKey()
+		assertNotNilF(t, err)
+		assertStringContainsE(t, err.Error(), "idp URL is required")
+	})
+}
+
+func TestNormalizeURL(t *testing.T) {
 	testcases := []struct {
-		host     string
-		user     string
-		credType tokenType
-		out      string
+		input    string
+		expected string
 	}{
-		{"testaccount.snowflakecomputing.com", "testuser", "mfaToken", "c4e781475e7a5e74aca87cd462afafa8cc48ebff6f6ccb5054b894dae5eb6345"}, // pragma: allowlist secret
-		{"testaccount.snowflakecomputing.com", "testuser", "IdToken", "5014e26489992b6ea56b50e936ba85764dc51338f60441bdd4a69eac7e15bada"},  // pragma: allowlist secret
+		{"https://login.microsoftonline.com:443/tenant-id/oauth2/v2.0", "LOGIN.MICROSOFTONLINE.COM:443/TENANT-ID/OAUTH2/V2.0"},
+		{"https://myorg-myaccount.privatelink.snowflakecomputing.com", "MYORG-MYACCOUNT.PRIVATELINK.SNOWFLAKECOMPUTING.COM"},
+		{"http://example.com/", "EXAMPLE.COM"},
+		{"https://user:pass@host.com/path", "HOST.COM/PATH"},
+		{"host.com", "HOST.COM"},
+		{"https://host.com?query=1#frag", "HOST.COM"},
+		{"", ""},
 	}
-	for _, test := range testcases {
-		target, err := buildCredentialsKey(test.host, test.user, test.credType)
+	for _, tc := range testcases {
+		t.Run(tc.input, func(t *testing.T) {
+			assertEqualE(t, normalizeURL(tc.input), tc.expected)
+		})
+	}
+}
+
+func TestNormalizeIdentifier(t *testing.T) {
+	testcases := []struct {
+		input    string
+		expected string
+	}{
+		{`"First Last"@long-corporate-domain.example.com`, `"First Last"@LONG-CORPORATE-DOMAIN.EXAMPLE.COM`},
+		{`"Analyst Role With Spaces":north_america:prod:readonly`, `"Analyst Role With Spaces":NORTH_AMERICA:PROD:READONLY`},
+		{"simpleRole", "SIMPLEROLE"},
+		{`"CaseSensitive"`, `"CaseSensitive"`},
+		{"", ""},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.input, func(t *testing.T) {
+			assertEqualE(t, normalizeIdentifier(tc.input), tc.expected)
+		})
+	}
+}
+
+func TestDifferentSnowflakeHostsProduceDifferentKeys(t *testing.T) {
+	key1, err := (&oauthTokenSpec{
+		tokenType: oauthAccessToken,
+		idp:       "https://idp.example.com/token",
+		snowflake: "https://account1.snowflakecomputing.com",
+		username:  "user",
+		role:      "ANALYST",
+	}).buildKey()
+	assertNilF(t, err)
+
+	key2, err := (&oauthTokenSpec{
+		tokenType: oauthAccessToken,
+		idp:       "https://idp.example.com/token",
+		snowflake: "https://account2.snowflakecomputing.com",
+		username:  "user",
+		role:      "ANALYST",
+	}).buildKey()
+	assertNilF(t, err)
+
+	assertNotEqualF(t, key1, key2)
+}
+
+func TestDifferentRolesProduceDifferentKeys(t *testing.T) {
+	key1, err := (&oauthTokenSpec{
+		tokenType: oauthAccessToken,
+		idp:       "https://idp.example.com/token",
+		snowflake: "https://account.snowflakecomputing.com",
+		username:  "user",
+		role:      "ANALYST",
+	}).buildKey()
+	assertNilF(t, err)
+
+	key2, err := (&oauthTokenSpec{
+		tokenType: oauthAccessToken,
+		idp:       "https://idp.example.com/token",
+		snowflake: "https://account.snowflakecomputing.com",
+		username:  "user",
+		role:      "ADMIN",
+	}).buildKey()
+	assertNilF(t, err)
+
+	assertNotEqualF(t, key1, key2)
+}
+
+func TestMfaWithEmptyRoleProducesStableKey(t *testing.T) {
+	key1, err := (&hostUserTokenSpec{
+		tokenType: mfaToken,
+		snowflake: "https://account.snowflakecomputing.com",
+		username:  "user",
+	}).buildKey()
+	assertNilF(t, err)
+
+	key2, err := (&hostUserTokenSpec{
+		tokenType: mfaToken,
+		snowflake: "https://account.snowflakecomputing.com",
+		username:  "user",
+	}).buildKey()
+	assertNilF(t, err)
+
+	assertEqualF(t, key1, key2)
+	assertStringContainsE(t, key1, "SnowflakeTokenCache.v2.MFA_TOKEN.")
+}
+
+func TestDifferentTokenTypesProduceDifferentKeys(t *testing.T) {
+	t.Run("OAuth access vs refresh", func(t *testing.T) {
+		key1, err := (&oauthTokenSpec{
+			tokenType: oauthAccessToken,
+			idp:       "https://idp.example.com/token",
+			snowflake: "https://account.snowflakecomputing.com",
+			username:  "user",
+			role:      "ANALYST",
+		}).buildKey()
 		assertNilF(t, err)
-		if target != test.out {
-			t.Fatalf("failed to convert target. expected: %v, but got: %v", test.out, target)
-		}
+
+		key2, err := (&oauthTokenSpec{
+			tokenType: oauthRefreshToken,
+			idp:       "https://idp.example.com/token",
+			snowflake: "https://account.snowflakecomputing.com",
+			username:  "user",
+			role:      "ANALYST",
+		}).buildKey()
+		assertNilF(t, err)
+		assertNotEqualF(t, key1, key2)
+	})
+
+	t.Run("MFA vs OAuth for same user/host", func(t *testing.T) {
+		mfaKey, err := (&hostUserTokenSpec{
+			tokenType: mfaToken,
+			snowflake: "https://account.snowflakecomputing.com",
+			username:  "user",
+		}).buildKey()
+		assertNilF(t, err)
+
+		oauthKey, err := (&oauthTokenSpec{
+			tokenType: oauthAccessToken,
+			idp:       "https://account.snowflakecomputing.com",
+			snowflake: "https://account.snowflakecomputing.com",
+			username:  "user",
+			role:      "",
+		}).buildKey()
+		assertNilF(t, err)
+		assertNotEqualF(t, mfaKey, oauthKey)
+	})
+}
+
+func TestCacheKeyUsesV2Prefix(t *testing.T) {
+	spec := &hostUserTokenSpec{tokenType: mfaToken, snowflake: "host.com", username: "user"}
+	key, err := spec.buildKey()
+	assertNilF(t, err)
+	assertStringContainsE(t, key, "SnowflakeTokenCache.v2.MFA_TOKEN.")
+}
+
+func TestFileBackendStoresKeyVerbatim(t *testing.T) {
+	skipOnWindows(t, "permission model is different")
+	credCacheDir, err := os.MkdirTemp("", "")
+	assertNilF(t, err)
+	defer os.RemoveAll(credCacheDir)
+	credCacheDirEnvOverride := overrideEnv(credCacheDirEnv, credCacheDir)
+	defer credCacheDirEnvOverride.rollback()
+	ssm, err := newFileBasedSecureStorageManager()
+	assertNilF(t, err)
+
+	tokenSpec := newMfaTokenSpec(&Config{Host: "host.com", User: "testuser"})
+	ssm.setCredential(tokenSpec, "testvalue")
+
+	fileContent, err := os.ReadFile(ssm.credFilePath())
+	assertNilF(t, err)
+	var m map[string]any
+	err = json.Unmarshal(fileContent, &m)
+	assertNilF(t, err)
+
+	expectedKey, err := tokenSpec.buildKey()
+	assertNilF(t, err)
+	assertStringContainsE(t, expectedKey, "SnowflakeTokenCache.v2.MFA_TOKEN.")
+
+	tokens := m["tokens"].(map[string]any)
+	assertEqualE(t, tokens[expectedKey], "testvalue")
+}
+
+func TestMfaKeyHasNoIdpOrRole(t *testing.T) {
+	// MFA keyData must contain only snowflake + username — no idp or role.
+	// Verify by computing the hash of the expected 2-field JSON manually.
+	expected2FieldJSON := `{"snowflake":"HOST.COM","username":"USER"}`
+	sum := sha256.Sum256([]byte(expected2FieldJSON))
+	expectedHash := hex.EncodeToString(sum[:])
+
+	spec := &hostUserTokenSpec{tokenType: mfaToken, snowflake: "host.com", username: "user"}
+	key, err := spec.buildKey()
+	assertNilF(t, err)
+	assertEqualF(t, key, "SnowflakeTokenCache.v2.MFA_TOKEN."+expectedHash)
+}
+
+func TestOAuthKeyHasFourFields(t *testing.T) {
+	// OAuth keyData must contain idp, role, snowflake, username — 4 fields.
+	expected4FieldJSON := `{"idp":"IDP.COM","role":"ANALYST","snowflake":"HOST.COM","username":"USER"}`
+	sum := sha256.Sum256([]byte(expected4FieldJSON))
+	expectedHash := hex.EncodeToString(sum[:])
+
+	spec := &oauthTokenSpec{
+		tokenType: oauthAccessToken,
+		idp:       "idp.com",
+		snowflake: "host.com",
+		username:  "user",
+		role:      "analyst",
 	}
+	key, err := spec.buildKey()
+	assertNilF(t, err)
+	assertEqualF(t, key, "SnowflakeTokenCache.v2.OAUTH_ACCESS_TOKEN."+expectedHash)
 }

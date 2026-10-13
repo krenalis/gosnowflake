@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -34,18 +35,23 @@ func (e *fakeHTTPError) Temporary() bool { return true }
 
 type fakeResponseBody struct {
 	body    []byte
-	cnt     int
+	read    int
 	onClose func()
 }
 
+// Read honours the io.Reader contract: it never reports more bytes than fit in
+// p. Returning len(b.body) unconditionally used to work only because
+// encoding/json v1 always handed it a buffer larger than the body; the v2
+// decoder starts with a 64-byte buffer and panics on an over-reported n.
+// Reaching EOF rewinds, so a body can be replayed across retries as before.
 func (b *fakeResponseBody) Read(p []byte) (n int, err error) {
-	if b.cnt == 0 {
-		copy(p, b.body)
-		b.cnt = 1
-		return len(b.body), nil
+	if b.read >= len(b.body) {
+		b.read = 0
+		return 0, io.EOF
 	}
-	b.cnt = 0
-	return 0, io.EOF
+	n = copy(p, b.body[b.read:])
+	b.read += n
+	return n, nil
 }
 
 func (b *fakeResponseBody) Close() error {
@@ -287,7 +293,16 @@ func TestRetryQuerySuccessWithRetryReasonDisabled(t *testing.T) {
 	}
 }
 
+// Runs inside a synctest bubble: the fake client's simulated one-second timeout
+// and the retry backoff waits are virtualized, so the test is instant and its
+// timing is deterministic.
 func TestRetryQuerySuccessWithTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		testRetryQuerySuccessWithTimeout(t)
+	})
+}
+
+func testRetryQuerySuccessWithTimeout(t *testing.T) {
 	logger.Info("Retry N times and Success")
 	client := &fakeHTTPClient{
 		cnt:     3,
@@ -497,87 +512,96 @@ func TestLoginRetry429(t *testing.T) {
 }
 
 func TestIsRetryable(t *testing.T) {
-	deadLineCtx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
 	defer cancel()
-	time.Sleep(2 * time.Nanosecond)
+
+	deadlineCtx, cancelDeadline := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelDeadline()
+
+	httpDeadlineErr := &url.Error{Err: context.DeadlineExceeded}
+	unknownErr := errors.ErrUnknownError()
+	loginReq := &http.Request{URL: &url.URL{Path: loginRequestPath}}
 
 	tcs := []struct {
-		ctx      context.Context
-		req      *http.Request
-		res      *http.Response
-		err      error
-		expected bool
+		name        string
+		ctx         context.Context
+		req         *http.Request
+		res         *http.Response
+		err         error
+		expected    bool
+		expectedErr error
 	}{
 		{
+			name:     "nil request and response",
 			ctx:      context.Background(),
-			req:      nil,
-			res:      nil,
-			err:      nil,
 			expected: false,
 		},
 		{
+			name:     "bad request is not retryable",
 			ctx:      context.Background(),
-			req:      nil,
 			res:      &http.Response{StatusCode: http.StatusBadRequest},
-			err:      nil,
 			expected: false,
 		},
 		{
+			name:     "login request with no response is not retryable",
 			ctx:      context.Background(),
-			req:      &http.Request{URL: &url.URL{Path: loginRequestPath}},
-			res:      nil,
-			err:      nil,
+			req:      loginReq,
 			expected: false,
 		},
 		{
+			name:     "login 404 is not retryable",
 			ctx:      context.Background(),
-			req:      &http.Request{URL: &url.URL{Path: loginRequestPath}},
+			req:      loginReq,
 			res:      &http.Response{StatusCode: http.StatusNotFound},
 			expected: false,
 		},
 		{
-			ctx:      context.Background(),
-			req:      &http.Request{URL: &url.URL{Path: loginRequestPath}},
-			res:      nil,
-			err:      &url.Error{Err: context.DeadlineExceeded},
-			expected: true,
+			name:        "http deadline exceeded is retryable",
+			ctx:         context.Background(),
+			req:         loginReq,
+			err:         httpDeadlineErr,
+			expected:    true,
+			expectedErr: context.DeadlineExceeded,
 		},
 		{
-			ctx:      context.Background(),
-			req:      &http.Request{URL: &url.URL{Path: loginRequestPath}},
-			res:      nil,
-			err:      errors.ErrUnknownError(),
-			expected: true,
+			name:        "unknown error is retryable",
+			ctx:         context.Background(),
+			req:         loginReq,
+			err:         unknownErr,
+			expected:    true,
+			expectedErr: unknownErr,
 		},
 		{
+			name:     "too many requests is retryable",
 			ctx:      context.Background(),
-			req:      &http.Request{URL: &url.URL{Path: loginRequestPath}},
+			req:      loginReq,
 			res:      &http.Response{StatusCode: http.StatusTooManyRequests},
-			err:      nil,
 			expected: true,
 		},
 		{
-			ctx:      deadLineCtx,
-			req:      &http.Request{URL: &url.URL{Path: loginRequestPath}},
-			res:      nil,
-			err:      &url.Error{Err: context.DeadlineExceeded},
-			expected: false,
+			name:        "cancelled context is not retryable even with http deadline exceeded",
+			ctx:         cancelledCtx,
+			req:         loginReq,
+			err:         httpDeadlineErr,
+			expected:    false,
+			expectedErr: context.Canceled,
 		},
 		{
-			ctx:      deadLineCtx,
-			req:      &http.Request{URL: &url.URL{Path: queryRequestPath}},
-			res:      nil,
-			err:      &url.Error{Err: context.DeadlineExceeded},
-			expected: false,
+			name:        "past deadline context is not retryable",
+			ctx:         deadlineCtx,
+			req:         loginReq,
+			err:         httpDeadlineErr,
+			expected:    false,
+			expectedErr: context.DeadlineExceeded,
 		},
 	}
 
 	for _, tc := range tcs {
-		t.Run(fmt.Sprintf("req %v, resp %v", tc.req, tc.res), func(t *testing.T) {
-			result, _ := isRetryableError(tc.ctx, tc.req, tc.res, tc.err)
-			if result != tc.expected {
-				t.Fatalf("expected %v, got %v; request: %v, response: %v", tc.expected, result, tc.req, tc.res)
-			}
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := isRetryableError(tc.ctx, tc.req, tc.res, tc.err)
+			assertEqualF(t, result, tc.expected)
+			assertErrIsF(t, err, tc.expectedErr)
 		})
 	}
 }

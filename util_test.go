@@ -6,19 +6,15 @@ import (
 	"fmt"
 	"maps"
 	"math/rand"
+	"net/http"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
-
-type tcIntMinMax struct {
-	v1  int
-	v2  int
-	out int
-}
 
 type tcUUID struct {
 	uuid string
@@ -74,8 +70,7 @@ func TestSimpleTokenAccessorGetTokensSynchronization(t *testing.T) {
 	var wg sync.WaitGroup
 	failed := false
 	for range 1000 {
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			// set a random session and token
 			session := rand.Int63()
 			sessionStr := strconv.FormatInt(session, 10)
@@ -87,8 +82,7 @@ func TestSimpleTokenAccessorGetTokensSynchronization(t *testing.T) {
 			if "t"+sessionStr != token || "m"+sessionStr != masterToken {
 				failed = true
 			}
-			wg.Done()
-		}()
+		})
 	}
 	// wait for all competing goroutines to finish setting and getting tokens
 	wg.Wait()
@@ -117,11 +111,11 @@ func TestSafeGetTokens(t *testing.T) {
 	}
 
 	for _, test := range testcases {
-		t.Run(fmt.Sprintf("%v", test.name), func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			_, _, sessionID := safeGetTokens(test.sr)
 			assertEqualE(t, sessionID, test.expectedSessionID, "expected sessionId to be %v, was %v",
-				fmt.Sprintf("%d", test.expectedSessionID),
-				fmt.Sprintf("%d", sessionID))
+				strconv.FormatInt(test.expectedSessionID, 10),
+				strconv.FormatInt(sessionID, 10))
 		})
 	}
 }
@@ -145,79 +139,6 @@ func TestGenerateRequestID(t *testing.T) {
 	otherRequestID := getOrGenerateRequestIDFromContext(context.Background())
 	if firstRequestID == otherRequestID {
 		t.Errorf("request id should not be the same")
-	}
-}
-
-func TestIntMin(t *testing.T) {
-	testcases := []tcIntMinMax{
-		{1, 3, 1},
-		{5, 100, 5},
-		{321, 3, 3},
-		{123, 123, 123},
-	}
-	for _, test := range testcases {
-		t.Run(fmt.Sprintf("%v_%v_%v", test.v1, test.v2, test.out), func(t *testing.T) {
-			a := intMin(test.v1, test.v2)
-			if test.out != a {
-				t.Errorf("failed int min. v1: %v, v2: %v, expected: %v, got: %v", test.v1, test.v2, test.out, a)
-			}
-		})
-	}
-}
-func TestIntMax(t *testing.T) {
-	testcases := []tcIntMinMax{
-		{1, 3, 3},
-		{5, 100, 100},
-		{321, 3, 321},
-		{123, 123, 123},
-	}
-	for _, test := range testcases {
-		t.Run(fmt.Sprintf("%v_%v_%v", test.v1, test.v2, test.out), func(t *testing.T) {
-			a := intMax(test.v1, test.v2)
-			if test.out != a {
-				t.Errorf("failed int max. v1: %v, v2: %v, expected: %v, got: %v", test.v1, test.v2, test.out, a)
-			}
-		})
-	}
-}
-
-type tcDurationMinMax struct {
-	v1  time.Duration
-	v2  time.Duration
-	out time.Duration
-}
-
-func TestDurationMin(t *testing.T) {
-	testcases := []tcDurationMinMax{
-		{1 * time.Second, 3 * time.Second, 1 * time.Second},
-		{5 * time.Second, 100 * time.Second, 5 * time.Second},
-		{321 * time.Second, 3 * time.Second, 3 * time.Second},
-		{123 * time.Second, 123 * time.Second, 123 * time.Second},
-	}
-	for _, test := range testcases {
-		t.Run(fmt.Sprintf("%v_%v_%v", test.v1, test.v2, test.out), func(t *testing.T) {
-			a := durationMin(test.v1, test.v2)
-			if test.out != a {
-				t.Errorf("failed duratoin max. v1: %v, v2: %v, expected: %v, got: %v", test.v1, test.v2, test.out, a)
-			}
-		})
-	}
-}
-
-func TestDurationMax(t *testing.T) {
-	testcases := []tcDurationMinMax{
-		{1 * time.Second, 3 * time.Second, 3 * time.Second},
-		{5 * time.Second, 100 * time.Second, 100 * time.Second},
-		{321 * time.Second, 3 * time.Second, 321 * time.Second},
-		{123 * time.Second, 123 * time.Second, 123 * time.Second},
-	}
-	for _, test := range testcases {
-		t.Run(fmt.Sprintf("%v_%v_%v", test.v1, test.v2, test.out), func(t *testing.T) {
-			a := durationMax(test.v1, test.v2)
-			if test.out != a {
-				t.Errorf("failed duratoin max. v1: %v, v2: %v, expected: %v, got: %v", test.v1, test.v2, test.out, a)
-			}
-		})
 	}
 }
 
@@ -288,7 +209,7 @@ func TestGetMin(t *testing.T) {
 		{[]int{}, -1},
 	}
 	for _, test := range testcases {
-		t.Run(fmt.Sprintf("%v", test.out), func(t *testing.T) {
+		t.Run(strconv.Itoa(test.out), func(t *testing.T) {
 			a := getMin(test.in)
 			if test.out != a {
 				t.Errorf("failed get min. in: %v, expected: %v, got: %v", test.in, test.out, a)
@@ -307,6 +228,7 @@ func TestValidURL(t *testing.T) {
 		{"https://ssoTestURL.okta.com", true},
 		{"https://ssoTestURL.okta.com:8080", true},
 		{"https://ssoTestURL.okta.com/testpathvalue", true},
+		{"https://my_account.snowflakecomputing.com", true},
 		{"-a calculator", false},
 		{"This is a random test", false},
 		{"file://TestForFile", false},
@@ -461,6 +383,12 @@ func TestInternal(t *testing.T) {
 	assertTrueE(t, isInternal(ctx))
 }
 
+func TestIsSkipFileTransfer(t *testing.T) {
+	assertFalseF(t, isSkipFileTransfer(context.Background()))
+	assertFalseF(t, isSkipFileTransfer(context.WithValue(context.Background(), skipFileTransfer, "true")))
+	assertTrueF(t, isSkipFileTransfer(withSkipFileTransfer(context.Background())))
+}
+
 type envOverride struct {
 	envName  string
 	oldValue string
@@ -556,4 +484,40 @@ func TestSyncParamsAll(t *testing.T) {
 		}()
 		wg.Wait()
 	})
+}
+
+// TestHeaderNames pins that header logging carries names only. Header values hold
+// session tokens, storage credentials and the SSE-C customer key; the log masking is
+// pattern-based and does not match the shape %v produces for an http.Header, so the
+// values are omitted rather than masked. If this test is ever changed to expect
+// values, that reasoning has to be revisited first.
+func TestHeaderNames(t *testing.T) {
+	const secret = "ver:1-hint:9823-ETMsDgAAAZ1kQ2hp" // pragma: allowlist secret
+	h := http.Header{
+		"X-Snowflake-Session": []string{"AbCdEf1234567890XyZ"},
+		"Authorization":       []string{`Snowflake Token="` + secret + `"`},
+		"Content-Type":        []string{"application/json"},
+	}
+
+	got := headerNames(h)
+
+	// Sorted, so log output does not vary with Go's map iteration order.
+	want := []string{"Authorization", "Content-Type", "X-Snowflake-Session"}
+	assertEqualE(t, len(got), len(want))
+	for i := range want {
+		assertEqualE(t, got[i], want[i])
+	}
+
+	// No value, in whole or in part, may appear in the rendered result.
+	rendered := fmt.Sprintf("Header names: %v", got)
+	for _, forbidden := range []string{secret, "ver:1-hint", "AbCdEf1234567890XyZ", "application/json"} {
+		if strings.Contains(rendered, forbidden) {
+			t.Errorf("header value %q leaked into %q", forbidden, rendered)
+		}
+	}
+}
+
+func TestHeaderNamesEmptyAndNil(t *testing.T) {
+	assertEqualE(t, len(headerNames(nil)), 0)
+	assertEqualE(t, len(headerNames(http.Header{})), 0)
 }

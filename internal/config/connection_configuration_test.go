@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"os"
 	path "path/filepath"
@@ -477,7 +478,7 @@ func TestParseToml(t *testing.T) {
 				"schema", "role", "region", "protocol", "passcode", "application", "token",
 				"tracing", "tmpDirPath", "tmp_dir_path", "clientConfigFile", "client_config_file", "oauth_authorization_url", "oauth_client_id",
 				"oauth_client_secret", "oauth_token_request_url", "oauth_redirect_uri", "oauth_scope",
-				"workload_identity_provider", "workload_identity_entra_resource", "proxyHost", "noProxy", "proxyUser", "proxyPassword", "proxyProtocol"},
+				"workload_identity_provider", "workload_identity_entra_resource", "workload_identity_host", "workloadIdentityHost", "proxyHost", "noProxy", "proxyUser", "proxyPassword", "proxyProtocol"},
 			values: []any{"value"},
 		},
 		{
@@ -518,6 +519,88 @@ func TestParseToml(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// TestParseTomlPrivateKeyFromFile verifies that connections.toml keypair auth
+// works when the key is supplied as a path to a PEM file (private_key_path /
+// private_key_file) rather than as inline base64 PKCS8 contents (privatekey).
+func TestParseTomlPrivateKeyFromFile(t *testing.T) {
+	generatedKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate test private key: %s", err.Error())
+	}
+
+	// Marshal to PKCS8 DER, then PEM-wrap
+	var pemKey []byte
+	pemKey, err = x509.MarshalPKCS8PrivateKey(generatedKey)
+	if err != nil {
+		t.Fatalf("Failed to marshal test private key: %s", err.Error())
+	}
+	pemData := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pemKey})
+
+	keyFile := createTmpFile(t, "exampleKey.p8", pemData)
+	defer os.Remove(keyFile)
+
+	// Exercise every accepted spelling. ParseToml normalizes keys via
+	// ToLower + strip underscores, so all four collapse to privatekeypath /
+	// privatekeyfile and must resolve to the same code path.
+	// See https://docs.snowflake.com/en/developer-guide/snowflake-cli/connecting/configure-connections#use-a-private-key-file-for-authentication
+	// for various path naming the CLI checks
+	for _, param := range []string{"private_key_path", "privateKeyPath", "private_key_file", "privateKeyFile"} {
+		t.Run(param, func(t *testing.T) {
+			cfg := &Config{}
+			connectionMap := map[string]any{param: keyFile}
+
+			if err := ParseToml(cfg, connectionMap); err != nil {
+				t.Fatalf("The value should be parsed: %v", err)
+			}
+			// The path must actually be loaded into cfg.PrivateKey, not silently
+			// discarded
+			if cfg.PrivateKey == nil {
+				t.Fatal("PrivateKey should be set from the key file path")
+			}
+			if !cfg.PrivateKey.Equal(generatedKey) {
+				t.Fatal("parsed PrivateKey does not equal the generated key")
+			}
+		})
+	}
+}
+
+// TestParseTomlPrivateKeyFromFileErrors verifies that a private_key_path /
+// private_key_file pointing at an unusable key surfaces an error from ParseToml
+// rather than silently leaving cfg.PrivateKey nil.
+func TestParseTomlPrivateKeyFromFileErrors(t *testing.T) {
+	badPath := path.Join(t.TempDir(), "does-not-exist.p8")
+
+	// A file that exists but does not contain a valid PEM key.
+	gibberishFile := createTmpFile(t, "gibberish.p8", []byte("not a pem key"))
+	defer os.Remove(gibberishFile)
+
+	testCases := []struct {
+		name  string
+		value string
+	}{
+		{name: "missing file", value: badPath},
+		{name: "invalid contents", value: gibberishFile},
+	}
+
+	for _, param := range []string{"private_key_path", "privateKeyPath", "private_key_file", "privateKeyFile"} {
+		for _, tc := range testCases {
+			t.Run(param+"/"+tc.name, func(t *testing.T) {
+				cfg := &Config{}
+				connectionMap := map[string]any{param: tc.value}
+
+				err := ParseToml(cfg, connectionMap)
+				if err == nil {
+					t.Fatal("expected an error for an unusable private key path")
+				}
+				// On failure the key must not be partially set.
+				if cfg.PrivateKey != nil {
+					t.Fatal("PrivateKey should remain nil when the key file cannot be loaded")
+				}
+			})
 		}
 	}
 }
@@ -566,6 +649,20 @@ func TestParseTomlWithWrongValue(t *testing.T) {
 	}
 }
 
+func TestParseTomlDisableOCSPChecksBeatsFailOpen(t *testing.T) {
+	unsetOCSPEnv(t, EnvVarDisableOCSPChecks)
+	cfg := &Config{}
+	err := ParseToml(cfg, map[string]any{
+		"disable_ocsp_checks": true,
+		"ocsp_fail_open":      true,
+	})
+	assertNilF(t, err, "ParseToml")
+	assertEqualF(t, cfg.DisableOCSPChecks, true, "DisableOCSPChecks")
+	assertEqualF(t, cfg.OCSPFailOpen, OCSPFailOpenTrue, "OCSPFailOpen")
+	assertEqualF(t, OCSPEnabled(cfg), false, "disable_ocsp_checks=true plus ocsp_fail_open=true must leave OCSP off")
+	assertEqualF(t, OcspMode(cfg), ocspModeInsecure, "OcspMode")
+}
+
 func TestGetTomlFilePath(t *testing.T) {
 	if (runtime.GOOS == "linux" || runtime.GOOS == "darwin") && os.Getenv("HOME") == "" {
 		t.Skip("skipping on missing HOME environment variable")
@@ -609,5 +706,34 @@ func assertEqual[T comparable](t *testing.T, got, want T) {
 	t.Helper()
 	if got != want {
 		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+// TestCheckParsingErrorDoesNotLogSecretValue checks that checkParsingError logs the
+// setting name only and not its value (SNOW-3649818).
+func TestCheckParsingErrorDoesNotLogSecretValue(t *testing.T) {
+	const secretValue = "B0bsRealSnowflakePwd_8123!" // pragma: allowlist secret
+
+	originalGlobalLogger := sflogger.GetLogger()
+	newLogger := sflogger.CreateDefaultLogger()
+	sflogger.SetLogger(newLogger)
+	buf := &bytes.Buffer{}
+	sflogger.GetLogger().SetOutput(buf)
+	defer func() {
+		sflogger.SetLogger(originalGlobalLogger)
+	}()
+
+	// Success path (err == nil): the WARN branch that fires for every parsed key.
+	checkParsingError(nil, "password", secretValue)
+	// Error path (err != nil): the ERROR branch.
+	checkParsingError(fmt.Errorf("boom"), "token", secretValue)
+
+	out := buf.String()
+	if strings.Contains(out, secretValue) {
+		t.Errorf("secret value leaked to logs by checkParsingError.\nLog output: %v", out)
+	}
+	// The key name is not sensitive and should still be logged for diagnostics.
+	if !strings.Contains(out, "Parsed key: password") || !strings.Contains(out, "Parsed key: token") {
+		t.Errorf("expected the key name to still be logged, got: %v", out)
 	}
 }

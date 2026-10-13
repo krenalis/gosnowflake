@@ -319,6 +319,94 @@ func TestArrayToString(t *testing.T) {
 	}
 }
 
+func TestStreamArrayTimestampToString(t *testing.T) {
+	loc := time.FixedZone("PDT", -7*3600)
+	tm := time.Date(2026, 9, 24, 3, 54, 24, 906498600, loc)
+	wholeSecond := time.Date(2026, 9, 24, 3, 54, 24, 0, loc)
+	preEpoch := time.Date(1960, 1, 2, 3, 4, 5, 60000000, loc)
+
+	ist := time.FixedZone("+0530", 5*3600+30*60)
+	tmIst := time.Date(2026, 9, 24, 3, 54, 24, 906498600, ist)
+	tmUtc := time.Date(2026, 9, 24, 10, 54, 24, 906498600, time.UTC)
+
+	testcases := []struct {
+		name string
+		in   driver.NamedValue
+		typ  types.SnowflakeType
+		out  string
+	}{
+		{
+			name: "ntz uses UTC wallclock (Z)",
+			in:   driver.NamedValue{Value: &timestampNtzArray{tm}},
+			typ:  types.TimestampNtzType,
+			out:  "2026-09-24 10:54:24.906498600 Z",
+		},
+		{
+			name: "ltz includes numeric offset",
+			in:   driver.NamedValue{Value: &timestampLtzArray{tm}},
+			typ:  types.TimestampLtzType,
+			out:  "2026-09-24 03:54:24.906498600 -07:00",
+		},
+		{
+			name: "tz includes numeric offset",
+			in:   driver.NamedValue{Value: &timestampTzArray{tm}},
+			typ:  types.TimestampTzType,
+			out:  "2026-09-24 03:54:24.906498600 -07:00",
+		},
+		{
+			name: "ltz +05:30",
+			in:   driver.NamedValue{Value: &timestampLtzArray{tmIst}},
+			typ:  types.TimestampLtzType,
+			out:  "2026-09-24 03:54:24.906498600 +05:30",
+		},
+		{
+			name: "tz +05:30",
+			in:   driver.NamedValue{Value: &timestampTzArray{tmIst}},
+			typ:  types.TimestampTzType,
+			out:  "2026-09-24 03:54:24.906498600 +05:30",
+		},
+		{
+			name: "ltz UTC produces Z",
+			in:   driver.NamedValue{Value: &timestampLtzArray{tmUtc}},
+			typ:  types.TimestampLtzType,
+			out:  "2026-09-24 10:54:24.906498600 Z",
+		},
+		{
+			name: "tz UTC produces Z",
+			in:   driver.NamedValue{Value: &timestampTzArray{tmUtc}},
+			typ:  types.TimestampTzType,
+			out:  "2026-09-24 10:54:24.906498600 Z",
+		},
+		{
+			name: "whole second keeps nine fractional digits",
+			in:   driver.NamedValue{Value: &timestampNtzArray{wholeSecond}},
+			typ:  types.TimestampNtzType,
+			out:  "2026-09-24 10:54:24.000000000 Z",
+		},
+		{
+			name: "pre epoch ltz",
+			in:   driver.NamedValue{Value: &timestampLtzArray{preEpoch}},
+			typ:  types.TimestampLtzType,
+			out:  "1960-01-02 03:04:05.060000000 -07:00",
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, a, err := snowflakeArrayToString(&tc.in, true)
+			assertNilF(t, err, "Unexpected error")
+			assertEqualF(t, s, tc.typ, "Snowflake type")
+			assertEqualF(t, len(a), 1, "array length")
+			assertNotNilF(t, a[0], "formatted value")
+			assertEqualF(t, *a[0], tc.out, "stream timestamp CSV")
+		})
+	}
+
+	localWallclock := tm.Format(format)
+	ntz, err := getTimestampBindValue(tm, true, types.TimestampNtzType)
+	assertNilF(t, err, "Unexpected error")
+	assertNotEqualF(t, ntz, localWallclock, "NTZ stream bind must not use local wallclock without offset")
+}
+
 func TestArrowToValues(t *testing.T) {
 	dest := make([]snowflakeValue, 2)
 
@@ -1197,4 +1285,89 @@ func mustArray(v any, typ ...any) driver.Value {
 		panic(fmt.Sprintf("failed to convert to array: %v", err))
 	}
 	return array
+}
+
+// exactDecimalString renders unscaled/10^scale exactly, independently of the conversion under test.
+func exactDecimalString(unscaled *big.Int, scale int) string {
+	pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+	return new(big.Rat).SetFrac(unscaled, pow).FloatString(scale)
+}
+
+// Fixed-point values with a non-zero scale must round-trip exactly, however many significant digits
+// they carry. The decimal128-backed path covers NUMBER with precision >= 19.
+func TestArrowDecimal128ToValueExactForNonZeroScale(t *testing.T) {
+	testcases := []struct {
+		unscaled string
+		scale    int
+	}{
+		// More significant digits than a 64-bit mantissa can represent.
+		{"12345678901234567890", 10},  // pragma: allowlist secret
+		{"-12345678901234567890", 10}, // pragma: allowlist secret
+		// 38 digits, the widest NUMBER Snowflake supports.
+		{"12345678901234567890123456789012345678", 10}, // pragma: allowlist secret
+		{"-12345678901234567890123456789012345678", 2}, // pragma: allowlist secret
+		{"99999999999999999999999999999999999999", 1},
+		// Values below one, where every digit is fractional.
+		{"5", 10},
+		{"-5", 10},
+		{"0", 10},
+		// Narrow values, as a regression guard.
+		{"12345", 2},
+		{"-12345", 2},
+	}
+
+	for _, tc := range testcases {
+		t.Run(fmt.Sprintf("%s_scale_%d", tc.unscaled, tc.scale), func(t *testing.T) {
+			unscaled, ok := new(big.Int).SetString(tc.unscaled, 10)
+			if !ok {
+				t.Fatalf("could not parse %v", tc.unscaled)
+			}
+			expected := exactDecimalString(unscaled, tc.scale)
+
+			builder := array.NewDecimal128Builder(memory.DefaultAllocator, &arrow.Decimal128Type{
+				Precision: 38, Scale: int32(tc.scale),
+			})
+			defer builder.Release()
+			builder.Append(decimal128.FromBigInt(unscaled))
+			arr := builder.NewDecimal128Array()
+			defer arr.Release()
+
+			meta := query.FieldMetadata{Type: "fixed", Precision: 38, Scale: tc.scale}
+			if actual := arrowDecimal128ToValue(arr, 0, false, meta); actual != expected {
+				t.Errorf("expected %v, got %v", expected, actual)
+			}
+		})
+	}
+}
+
+// The integer-backed path covers NUMBER with precision <= 18.
+func TestArrowIntToValueExactForNonZeroScale(t *testing.T) {
+	testcases := []struct {
+		val   int64
+		scale int
+	}{
+		// More significant digits than a float64 mantissa can represent.
+		{123456789012345678, 4},
+		{-123456789012345678, 4},
+		{999999999999999999, 2},
+		{math.MaxInt64, 2},
+		{math.MinInt64, 2},
+		{12345678901234567, 2},
+		// Narrow values, as a regression guard.
+		{1234567890, 2},
+		{-1234567890, 2},
+		{5, 10},
+		{0, 2},
+	}
+
+	for _, tc := range testcases {
+		t.Run(fmt.Sprintf("%d_scale_%d", tc.val, tc.scale), func(t *testing.T) {
+			expected := exactDecimalString(big.NewInt(tc.val), tc.scale)
+
+			meta := query.FieldMetadata{Type: "fixed", Precision: 18, Scale: tc.scale}
+			if actual := arrowIntToValue(meta, false, tc.val); actual != expected {
+				t.Errorf("expected %v, got %v", expected, actual)
+			}
+		})
+	}
 }

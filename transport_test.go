@@ -3,6 +3,7 @@ package gosnowflake
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"testing"
@@ -16,6 +17,7 @@ func TestTransportFactoryErrorHandling(t *testing.T) {
 	// Test CreateCustomTLSTransport with conflicting OCSP and CRL settings
 	conflictingConfig := &Config{
 		DisableOCSPChecks:       false,
+		OCSPFailOpen:            OCSPFailOpenTrue,
 		CertRevocationCheckMode: CertRevocationCheckEnabled,
 		TLSConfigName:           "TestTransportFactoryErrorHandlingTlsConfig",
 	}
@@ -33,6 +35,7 @@ func TestCreateStandardTransportErrorHandling(t *testing.T) {
 	// Test CreateStandardTransport with conflicting settings
 	conflictingConfig := &Config{
 		DisableOCSPChecks:       false,
+		OCSPFailOpen:            OCSPFailOpenTrue,
 		CertRevocationCheckMode: CertRevocationCheckEnabled,
 	}
 
@@ -127,6 +130,36 @@ func TestRegisteredTLSConfigUsage(t *testing.T) {
 	assertNotNilF(t, transport, "Expected non-nil transport")
 }
 
+// TestDisableOCSPChecksPreservesRegisteredTLSConfig is a regression test for
+// SNOW-3649867: disabling OCSP revocation checking must NOT discard a
+// user-registered TLS config (e.g. certificate pinning). The registered
+// config's fields must survive onto the resulting transport's TLSClientConfig
+// instead of falling back to Go's default verification (nil TLSClientConfig).
+func TestDisableOCSPChecksPreservesRegisteredTLSConfig(t *testing.T) {
+	const name = "TestDisableOCSPChecksPreservesRegisteredTLSConfig"
+	pinned := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: "pinned.example.com",
+	}
+	assertNilF(t, RegisterTLSConfig(name, pinned))
+	defer func() { assertNilF(t, DeregisterTLSConfig(name)) }()
+
+	config := &Config{
+		DisableOCSPChecks:       true,
+		CertRevocationCheckMode: CertRevocationCheckDisabled,
+		TLSConfigName:           name,
+	}
+	factory := newTransportFactory(config, nil)
+	rt, err := factory.createTransport(transportConfigFor(transportTypeSnowflake))
+	assertNilF(t, err)
+
+	transport, ok := rt.(*http.Transport)
+	assertTrueF(t, ok, "expected *http.Transport")
+	assertNotNilF(t, transport.TLSClientConfig, "registered TLS config must not be dropped when OCSP is disabled")
+	assertEqualE(t, transport.TLSClientConfig.MinVersion, uint16(tls.VersionTLS13))
+	assertEqualE(t, transport.TLSClientConfig.ServerName, "pinned.example.com")
+}
+
 func TestDirectTLSConfigOnly(t *testing.T) {
 	// Test that direct TLS config works without any registration
 
@@ -206,6 +239,33 @@ func TestProxyTransportCreation(t *testing.T) {
 				NoProxy:       "*.snowflakecomputing.com,ocsp.testing.com",
 			},
 			proxyURL: "",
+		},
+		{
+			// A literal IPv6 proxy host has to be bracketed, otherwise the
+			// resulting proxy URL cannot be parsed at all.
+			config: &Config{
+				ProxyProtocol: "http",
+				ProxyHost:     "::1",
+				ProxyPort:     1234,
+			},
+			proxyURL: "http://[::1]:1234",
+		},
+		{
+			config: &Config{
+				ProxyProtocol: "https",
+				ProxyHost:     "2001:db8::1",
+				ProxyPort:     1234,
+			},
+			proxyURL: "https://[2001:db8::1]:1234",
+		},
+		{
+			// Already bracketed by the user - must not be double-bracketed.
+			config: &Config{
+				ProxyProtocol: "http",
+				ProxyHost:     "[fe80::1]",
+				ProxyPort:     1234,
+			},
+			proxyURL: "http://[fe80::1]:1234",
 		},
 	}
 
@@ -295,5 +355,9 @@ func TestWrapDialContextIgnoredWithTransporter(t *testing.T) {
 }
 
 func createTestNoRevocationTransport() http.RoundTripper {
-	return newTransportFactory(&Config{}, nil).createNoRevocationTransport(defaultTransportConfigs.forTransportType(transportTypeSnowflake))
+	transport, err := newTransportFactory(&Config{}, nil).createNoRevocationTransport(defaultTransportConfigs.forTransportType(transportTypeSnowflake))
+	if err != nil {
+		panic(fmt.Sprintf("failed to create test transport: %v", err))
+	}
+	return transport
 }

@@ -641,8 +641,16 @@ func TestIsPrivateLink(t *testing.T) {
 		{"testaccount.some-region.privatelink.snowflakecomputing.mil", true},
 		{"testaccount.us-east-1.privatelink.snowflakecOMPUTING.com", true},
 		{"snowhouse.snowflakecomputing.xyz", false},
-		{"snowhouse.privatelink.snowflakecomputing.xyz", true},
-		{"snowhouse.PRIVATELINK.snowflakecomputing.xyz", true},
+		{"snowhouse.privatelink.snowflakecomputing.xyz", false},
+		{"snowhouse.PRIVATELINK.snowflakecomputing.xyz", false},
+		{"testacct.privatelink.snowflakecomputing.mil", true},
+		{"notprivatelink.snowflakecomputing.com", false},
+		// suffix must be anchored at a label boundary
+		{"acct.privatelink.snowflakecomputing.com.attacker.example", false},
+		// LDH gate: '@' in host must be rejected
+		{"acct.privatelink.snowflakecomputing.com@attacker.example", false},
+		// underscore in label is permitted
+		{"my_acct.privatelink.snowflakecomputing.com", true},
 	} {
 		t.Run(tc.host, func(t *testing.T) {
 			assertEqualE(t, checkIsPrivateLink(tc.host), tc.isPrivatelink)
@@ -840,8 +848,7 @@ func TestConcurrentReadOnParams(t *testing.T) {
 	var successCount, failureCount int32
 	wg := sync.WaitGroup{}
 	for range 10 {
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			for range 10 {
 				func() {
 					stmt, err := db.PrepareContext(context.Background(), "SELECT table_schema FROM information_schema.columns WHERE table_schema = ? LIMIT 1")
@@ -868,8 +875,7 @@ func TestConcurrentReadOnParams(t *testing.T) {
 					}
 				}()
 			}
-			wg.Done()
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -1039,20 +1045,25 @@ func TestGetTransport(t *testing.T) {
 		roundTripperCheck func(t *testing.T, roundTripper http.RoundTripper)
 	}{
 		{
-			name: "DisableOCSPChecks",
+			name: "DisableOCSPChecks false is default-off",
 			cfg:  &Config{Account: "one", DisableOCSPChecks: false},
 			transportCheck: func(t *testing.T, transport *http.Transport) {
-				// We should have a verifier function
 				assertNotNilF(t, transport)
-				assertNotNilF(t, transport.TLSClientConfig)
-				assertNotNilF(t, transport.TLSClientConfig.VerifyPeerCertificate)
+				assertNilF(t, transport.TLSClientConfig)
 			},
 		},
 		{
-			name: "DisableOCSPChecks missing from Config",
+			name: "DisableOCSPChecks missing from Config is default-off",
 			cfg:  &Config{Account: "four"},
 			transportCheck: func(t *testing.T, transport *http.Transport) {
-				// We should have a verifier function
+				assertNotNilF(t, transport)
+				assertNilF(t, transport.TLSClientConfig)
+			},
+		},
+		{
+			name: "explicit fail-open installs OCSP verifier",
+			cfg:  &Config{Account: "ocsp-on", OCSPFailOpen: OCSPFailOpenTrue},
+			transportCheck: func(t *testing.T, transport *http.Transport) {
 				assertNotNilF(t, transport)
 				assertNotNilF(t, transport.TLSClientConfig)
 				assertNotNilF(t, transport.TLSClientConfig.VerifyPeerCertificate)
