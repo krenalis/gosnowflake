@@ -1,12 +1,12 @@
 package gosnowflake
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
-	"github.com/snowflakedb/gosnowflake/v2/internal/query"
-	"github.com/snowflakedb/gosnowflake/v2/internal/types"
 	"io"
 	"math"
 	"math/big"
@@ -20,6 +20,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/snowflakedb/gosnowflake/v2/internal/query"
+	"github.com/snowflakedb/gosnowflake/v2/internal/types"
 )
 
 func stringIntToDecimal(src string) (decimal128.Num, bool) {
@@ -1370,4 +1372,379 @@ func TestArrowIntToValueExactForNonZeroScale(t *testing.T) {
 			}
 		})
 	}
+}
+
+func installTestLogger(t *testing.T, level string) *bytes.Buffer {
+	t.Helper()
+	original := GetLogger()
+	buf := &bytes.Buffer{}
+	log := CreateDefaultLogger()
+	assertNilF(t, log.SetLogLevel(level), "set log level")
+	log.SetOutput(buf)
+	assertNilF(t, SetLogger(log), "install logger")
+	t.Cleanup(func() {
+		assertNilF(t, SetLogger(original), "restore logger")
+	})
+	return buf
+}
+
+func TestStringToValueInfoLevelSkipsLogAllocs(t *testing.T) {
+	installTestLogger(t, "info")
+
+	shortSrc := "hello"
+	longSrc := strings.Repeat("x", 2048)
+	rowType := query.ExecResponseRowType{Type: "text"}
+	ctx := context.Background()
+
+	convert := func(src *string) {
+		var dest driver.Value
+		err := stringToValue(ctx, &dest, rowType, src, nil, nil)
+		assertNilF(t, err, "stringToValue")
+	}
+
+	shortAllocs := testing.AllocsPerRun(200, func() { convert(&shortSrc) })
+	longAllocs := testing.AllocsPerRun(200, func() { convert(&longSrc) })
+	assertEqualF(t, shortAllocs, longAllocs, "a long cell must not allocate a truncated log argument at INFO")
+}
+
+func TestStringToValueDebugStillEmitted(t *testing.T) {
+	buf := installTestLogger(t, "debug")
+
+	src := "1609459200.123456789"
+	var dest driver.Value
+	err := stringToValue(context.Background(), &dest, query.ExecResponseRowType{Type: "timestamp_ntz"}, &src, time.UTC, nil)
+	assertNilF(t, err, "stringToValue")
+
+	out := buf.String()
+	assertStringContainsF(t, out, "snowflake data type: timestamp_ntz", "column type is logged at debug")
+	assertStringContainsF(t, out, "raw value: 1609459200.123456789", "raw value is logged at debug")
+	assertStringContainsF(t, out, "sec:", "timestamp seconds are logged at debug")
+	assertStringContainsF(t, out, "nsec:", "timestamp nanos are logged at debug")
+
+	longSrc := strings.Repeat("y", 2048)
+	buf.Reset()
+	err = stringToValue(context.Background(), &dest, query.ExecResponseRowType{Type: "text"}, &longSrc, nil, nil)
+	assertNilF(t, err, "stringToValue long text")
+	assertStringContainsF(t, buf.String(), "bytes total", "long values are still truncated in debug logs")
+}
+
+func TestStringToValueInfoSuppressesPerValueLogs(t *testing.T) {
+	buf := installTestLogger(t, "info")
+
+	src := "1609459200.123456789"
+	var dest driver.Value
+	err := stringToValue(context.Background(), &dest, query.ExecResponseRowType{Type: "timestamp_ntz"}, &src, time.UTC, nil)
+	assertNilF(t, err, "stringToValue")
+	assertEmptyStringE(t, buf.String(), "per-value logs are suppressed at INFO")
+}
+
+func BenchmarkStringToValueInfoLevel(b *testing.B) {
+	original := GetLogger()
+	b.Cleanup(func() {
+		if err := SetLogger(original); err != nil {
+			b.Errorf("restore logger: %v", err)
+		}
+	})
+	log := CreateDefaultLogger()
+	if err := log.SetLogLevel("info"); err != nil {
+		b.Fatal(err)
+	}
+	log.SetOutput(io.Discard)
+	if err := SetLogger(log); err != nil {
+		b.Fatal(err)
+	}
+
+	src := "hello"
+	rowType := query.ExecResponseRowType{Type: "text"}
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var dest driver.Value
+		if err := stringToValue(ctx, &dest, rowType, &src, nil, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func convertArrowValue(ctx context.Context, t *testing.T, meta query.FieldMetadata, value arrow.Array, sfType types.SnowflakeType) (snowflakeValue, error) {
+	t.Helper()
+	var panicked any
+	got, err := func() (snowflakeValue, error) {
+		defer func() { panicked = recover() }()
+		return arrowToValue(ctx, 0, meta, value, time.UTC, false, nil, sfType)
+	}()
+	assertNilF(t, panicked, "arrowToValue panicked")
+	return got, err
+}
+
+func arrowStringColumn(t *testing.T, pool memory.Allocator, value string) arrow.Array {
+	t.Helper()
+	b := array.NewStringBuilder(pool)
+	t.Cleanup(b.Release)
+	b.Append(value)
+	col := b.NewArray()
+	t.Cleanup(col.Release)
+	return col
+}
+
+func arrowStringList(t *testing.T, pool memory.Allocator, values []string, null bool) arrow.Array {
+	t.Helper()
+	b := array.NewListBuilder(pool, arrow.BinaryTypes.String)
+	t.Cleanup(b.Release)
+	if null {
+		b.AppendNull()
+	} else {
+		b.Append(true)
+		vb := b.ValueBuilder().(*array.StringBuilder)
+		for _, v := range values {
+			vb.Append(v)
+		}
+	}
+	col := b.NewArray()
+	t.Cleanup(col.Release)
+	return col
+}
+
+func arrowStringStruct(t *testing.T, pool memory.Allocator, value string, null bool) arrow.Array {
+	t.Helper()
+	b := array.NewStructBuilder(pool, arrow.StructOf(
+		arrow.Field{Name: "s", Type: arrow.BinaryTypes.String, Nullable: true},
+	))
+	t.Cleanup(b.Release)
+	if null {
+		b.AppendNull()
+	} else {
+		b.Append(true)
+		b.FieldBuilder(0).(*array.StringBuilder).Append(value)
+	}
+	col := b.NewArray()
+	t.Cleanup(col.Release)
+	return col
+}
+
+func arrowBooleanColumn(t *testing.T, pool memory.Allocator, value bool) arrow.Array {
+	t.Helper()
+	b := array.NewBooleanBuilder(pool)
+	t.Cleanup(b.Release)
+	b.Append(value)
+	col := b.NewArray()
+	t.Cleanup(col.Release)
+	return col
+}
+
+func TestArrowToValueStructuredJSONString(t *testing.T) {
+	pool := memory.NewGoAllocator()
+	textArray := query.FieldMetadata{
+		Name: "C1",
+		Type: "array",
+		Fields: []query.FieldMetadata{{
+			Name:     "value",
+			Type:     "text",
+			Nullable: true,
+		}},
+	}
+	noSchema := query.FieldMetadata{Name: "C1", Type: "array", Nullable: true}
+	jsonText := `["a","b"]`
+
+	t.Run("no field metadata returns the JSON string", func(t *testing.T) {
+		for _, ctx := range []context.Context{context.Background(), WithStructuredTypesEnabled(context.Background())} {
+			got, err := convertArrowValue(ctx, t, noSchema, arrowStringColumn(t, pool, jsonText), types.ArrayType)
+			assertNilF(t, err, "semi-structured ARRAY")
+			assertEqualF(t, got, jsonText, "semi-structured ARRAY is returned as a string")
+		}
+	})
+
+	t.Run("field metadata with structured types disabled returns the JSON string", func(t *testing.T) {
+		got, err := convertArrowValue(context.Background(), t, textArray, arrowStringColumn(t, pool, jsonText), types.ArrayType)
+		assertNilF(t, err, "structured ARRAY as JSON with the flag off")
+		assertEqualF(t, got, jsonText, "flag off keeps the JSON string")
+	})
+
+	t.Run("field metadata with structured types enabled deserialises the JSON array", func(t *testing.T) {
+		got, err := convertArrowValue(WithStructuredTypesEnabled(context.Background()), t, textArray, arrowStringColumn(t, pool, jsonText), types.ArrayType)
+		assertNilF(t, err, "structured ARRAY as JSON with the flag on")
+		assertDeepEqualE(t, got, []string{"a", "b"}, "flag on deserialises the JSON array")
+	})
+}
+
+func TestArrowToValueStructuredObjectJSONString(t *testing.T) {
+	pool := memory.NewGoAllocator()
+	objectMeta := query.FieldMetadata{
+		Name: "C1",
+		Type: "object",
+		Fields: []query.FieldMetadata{{
+			Name:     "s",
+			Type:     "text",
+			Nullable: true,
+		}},
+	}
+	jsonText := `{"s":"hello"}`
+	noSchema := query.FieldMetadata{Name: "C1", Type: "object", Nullable: true}
+
+	t.Run("no field metadata returns the JSON string", func(t *testing.T) {
+		for _, ctx := range []context.Context{context.Background(), WithStructuredTypesEnabled(context.Background())} {
+			got, err := convertArrowValue(ctx, t, noSchema, arrowStringColumn(t, pool, jsonText), types.ObjectType)
+			assertNilF(t, err, "semi-structured OBJECT")
+			assertEqualF(t, got, jsonText, "semi-structured OBJECT is returned as a string")
+		}
+	})
+
+	t.Run("flag off returns the JSON string", func(t *testing.T) {
+		got, err := convertArrowValue(context.Background(), t, objectMeta, arrowStringColumn(t, pool, jsonText), types.ObjectType)
+		assertNilF(t, err, "structured OBJECT as JSON with the flag off")
+		assertEqualF(t, got, jsonText, "flag off keeps the JSON string")
+	})
+
+	t.Run("flag on deserialises the JSON object", func(t *testing.T) {
+		got, err := convertArrowValue(WithStructuredTypesEnabled(context.Background()), t, objectMeta, arrowStringColumn(t, pool, jsonText), types.ObjectType)
+		assertNilF(t, err, "structured OBJECT as JSON with the flag on")
+		st, ok := got.(*structuredType)
+		assertTrueF(t, ok, "flag on returns a structured object")
+		s, err := st.GetString("s")
+		assertNilF(t, err, "reading field s")
+		assertEqualF(t, s, "hello", "deserialised field s")
+	})
+}
+
+func TestArrowToValueNativeArrowStructuredTypesDisabled(t *testing.T) {
+	pool := memory.NewGoAllocator()
+	textArray := query.FieldMetadata{
+		Name: "C1",
+		Type: "array",
+		Fields: []query.FieldMetadata{{
+			Name:     "value",
+			Type:     "text",
+			Nullable: true,
+		}},
+	}
+	objectMeta := query.FieldMetadata{
+		Name: "C1",
+		Type: "object",
+		Fields: []query.FieldMetadata{{
+			Name:     "s",
+			Type:     "text",
+			Nullable: true,
+		}},
+	}
+
+	t.Run("native list returns the structured-types error", func(t *testing.T) {
+		_, err := convertArrowValue(context.Background(), t, textArray, arrowStringList(t, pool, []string{"a"}, false), types.ArrayType)
+		assertErrIsF(t, err, errNativeArrowWithoutProperContext, "native ARRAY with the flag off")
+	})
+
+	t.Run("native struct returns the structured-types error", func(t *testing.T) {
+		_, err := convertArrowValue(context.Background(), t, objectMeta, arrowStringStruct(t, pool, "hello", false), types.ObjectType)
+		assertErrIsF(t, err, errNativeArrowWithoutProperContext, "native OBJECT with the flag off")
+	})
+
+	t.Run("null native list is SQL NULL", func(t *testing.T) {
+		got, err := convertArrowValue(context.Background(), t, textArray, arrowStringList(t, pool, nil, true), types.ArrayType)
+		assertNilF(t, err, "null native ARRAY")
+		assertNilF(t, got, "null native ARRAY value")
+	})
+
+	t.Run("null native struct is SQL NULL", func(t *testing.T) {
+		got, err := convertArrowValue(context.Background(), t, objectMeta, arrowStringStruct(t, pool, "", true), types.ObjectType)
+		assertNilF(t, err, "null native OBJECT")
+		assertNilF(t, got, "null native OBJECT value")
+	})
+}
+
+func TestArrowToValueNativeArrowStructuredTypesEnabled(t *testing.T) {
+	pool := memory.NewGoAllocator()
+	ctx := WithStructuredTypesEnabled(context.Background())
+	textArray := query.FieldMetadata{
+		Name: "C1",
+		Type: "array",
+		Fields: []query.FieldMetadata{{
+			Name:     "value",
+			Type:     "text",
+			Nullable: true,
+		}},
+	}
+	objectMeta := query.FieldMetadata{
+		Name: "C1",
+		Type: "object",
+		Fields: []query.FieldMetadata{{
+			Name:     "s",
+			Type:     "text",
+			Nullable: true,
+		}},
+	}
+
+	t.Run("native list deserialises to a slice", func(t *testing.T) {
+		got, err := convertArrowValue(ctx, t, textArray, arrowStringList(t, pool, []string{"a", "b"}, false), types.ArrayType)
+		assertNilF(t, err, "native ARRAY with the flag on")
+		assertDeepEqualE(t, got, []string{"a", "b"}, "native ARRAY deserialises to a slice")
+	})
+
+	t.Run("native struct deserialises to an object", func(t *testing.T) {
+		got, err := convertArrowValue(ctx, t, objectMeta, arrowStringStruct(t, pool, "hello", false), types.ObjectType)
+		assertNilF(t, err, "native OBJECT with the flag on")
+		st, ok := got.(*structuredType)
+		assertTrueF(t, ok, "native OBJECT returns a structured object")
+		s, err := st.GetString("s")
+		assertNilF(t, err, "reading field s")
+		assertEqualF(t, s, "hello", "native field s")
+	})
+}
+
+func TestArrowToValueSemiStructuredNativeArrow(t *testing.T) {
+	pool := memory.NewGoAllocator()
+	noSchema := query.FieldMetadata{Name: "C1", Nullable: true}
+
+	t.Run("ARRAY", func(t *testing.T) {
+		_, err := convertArrowValue(context.Background(), t, noSchema, arrowStringList(t, pool, []string{"a"}, false), types.ArrayType)
+		assertNotNilF(t, err, "semi-structured ARRAY is not a native list")
+		assertFalseF(t, errors.Is(err, errNativeArrowWithoutProperContext), "missing field metadata is not the structured-types flag")
+		assertStringContainsF(t, err.Error(), "list<item: utf8", "error names the Arrow type")
+		assertStringContainsF(t, err.Error(), "expected a JSON string", "error names the expected JSON string")
+	})
+
+	t.Run("OBJECT", func(t *testing.T) {
+		_, err := convertArrowValue(context.Background(), t, noSchema, arrowStringStruct(t, pool, "hello", false), types.ObjectType)
+		assertNotNilF(t, err, "semi-structured OBJECT is not a native struct")
+		assertFalseF(t, errors.Is(err, errNativeArrowWithoutProperContext), "missing field metadata is not the structured-types flag")
+		assertStringContainsF(t, err.Error(), "struct<s: utf8>", "error names the Arrow type")
+		assertStringContainsF(t, err.Error(), "expected a JSON string", "error names the expected JSON string")
+	})
+}
+
+func TestArrowToValueNativeArrowWrongType(t *testing.T) {
+	pool := memory.NewGoAllocator()
+	ctx := WithStructuredTypesEnabled(context.Background())
+	col := arrowBooleanColumn(t, pool, true)
+	textArray := query.FieldMetadata{
+		Name: "C1",
+		Type: "array",
+		Fields: []query.FieldMetadata{{
+			Name:     "value",
+			Type:     "text",
+			Nullable: true,
+		}},
+	}
+	objectMeta := query.FieldMetadata{
+		Name: "C1",
+		Type: "object",
+		Fields: []query.FieldMetadata{{
+			Name:     "s",
+			Type:     "text",
+			Nullable: true,
+		}},
+	}
+
+	t.Run("ARRAY", func(t *testing.T) {
+		_, err := convertArrowValue(ctx, t, textArray, col, types.ArrayType)
+		assertNotNilF(t, err, "boolean column is not an Arrow list")
+		assertStringContainsF(t, err.Error(), "bool", "error names the Arrow type")
+		assertStringContainsF(t, err.Error(), "expected an Arrow list", "error names the expected type")
+	})
+
+	t.Run("OBJECT", func(t *testing.T) {
+		_, err := convertArrowValue(ctx, t, objectMeta, col, types.ObjectType)
+		assertNotNilF(t, err, "boolean column is not an Arrow struct")
+		assertStringContainsF(t, err.Error(), "bool", "error names the Arrow type")
+		assertStringContainsF(t, err.Error(), "expected an Arrow struct", "error names the expected type")
+	})
 }
